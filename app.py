@@ -29,7 +29,7 @@ import streamlit as st
 
 from data_utils import (
     Cycle, load_tga_csv, extract_cycle, detect_plateau_segments,
-    df_to_csv_bytes, dfs_to_excel_bytes,
+    df_to_csv_bytes, dfs_to_excel_bytes, M_CAO,
 )
 from kinetic_models import (
     MODELS, MODEL_ORDER, fit_two_stage, fit_two_stage_mixed,
@@ -232,18 +232,28 @@ with tab_load:
                 "Selected end (min)", min_value=t_min, max_value=t_max,
                 format="%.4f", key="sel_end",
             )
+        st.session_state.setdefault("sel_label", f"Cycle {st.session_state['next_cycle_index']}")
         with c3:
-            default_label = f"Cycle {st.session_state['next_cycle_index']}"
-            cyc_label = st.text_input("Cycle label", value=default_label, key="sel_label")
+            cyc_label = st.text_input("Cycle label", key="sel_label")
 
         if st.button("Add selection as a cycle", type="primary"):
+            existing_labels = {c.label for c in st.session_state["cycles"]}
             if t_end <= t_start:
                 st.error("End time must be greater than start time.")
+            elif cyc_label in existing_labels:
+                st.error(
+                    f"A cycle named '{cyc_label}' already exists — each cycle needs a "
+                    "unique label (the kinetics/compare tabs look cycles up by label). "
+                    "Change the label and add again."
+                )
             else:
                 cyc = Cycle(label=cyc_label, t_start=t_start, t_end=t_end,
                            source_file=fname, cycle_index=st.session_state["next_cycle_index"])
                 st.session_state["cycles"].append(cyc)
                 st.session_state["next_cycle_index"] += 1
+                # reset the label field's default for the *next* cycle - otherwise the
+                # text_input keeps showing this same label on every future rerun
+                st.session_state["sel_label"] = f"Cycle {st.session_state['next_cycle_index']}"
                 st.success(f"Added '{cyc_label}' ({t_start:.2f}–{t_end:.2f} min).")
 
         # ---------------- Optional auto-detect helper ----------------
@@ -266,19 +276,28 @@ with tab_load:
                     seg_df = pd.DataFrame(segs, columns=["t_start", "t_end"])
                     seg_df["duration_min"] = seg_df["t_end"] - seg_df["t_start"]
                     seg_df.insert(0, "import", True)
-                    seg_df.insert(1, "label", [f"Cycle {i+1}" for i in range(len(seg_df))])
+                    start_idx = st.session_state["next_cycle_index"]
+                    seg_df.insert(1, "label", [f"Cycle {start_idx + i}" for i in range(len(seg_df))])
                     edited = st.data_editor(seg_df, key="seg_editor", hide_index=True)
                     if st.button("Import checked segments as cycles"):
-                        n_added = 0
+                        n_added, n_skipped = 0, 0
                         for _, row in edited.iterrows():
-                            if row["import"]:
-                                cyc = Cycle(label=row["label"], t_start=float(row["t_start"]),
-                                           t_end=float(row["t_end"]), source_file=fname,
-                                           cycle_index=st.session_state["next_cycle_index"])
-                                st.session_state["cycles"].append(cyc)
-                                st.session_state["next_cycle_index"] += 1
-                                n_added += 1
-                        st.success(f"Imported {n_added} cycle(s).")
+                            if not row["import"]:
+                                continue
+                            existing_labels = {c.label for c in st.session_state["cycles"]}
+                            if row["label"] in existing_labels:
+                                n_skipped += 1
+                                continue
+                            cyc = Cycle(label=row["label"], t_start=float(row["t_start"]),
+                                       t_end=float(row["t_end"]), source_file=fname,
+                                       cycle_index=st.session_state["next_cycle_index"])
+                            st.session_state["cycles"].append(cyc)
+                            st.session_state["next_cycle_index"] += 1
+                            n_added += 1
+                        msg = f"Imported {n_added} cycle(s)."
+                        if n_skipped:
+                            msg += f" Skipped {n_skipped} with a label that was already in use."
+                        st.success(msg)
 
         # ---------------- Defined cycles table ----------------
         st.subheader("Defined cycles")
@@ -544,14 +563,24 @@ with tab_compare:
             if len(selected_cycles) >= 3:
                 Ns = [cr.cycle_index for cr in cycle_results]
                 caps = [cr.capacity_mmol_per_g for cr in cycle_results]
-                fit = fit_grasa_abanades(Ns, caps)
+                # The Grasa-Abanades model is defined for a fractional conversion in
+                # [0, 1]; fit it on that scale (using the same theoretical maximum
+                # capacity used elsewhere) rather than on raw mmol CO2/g values,
+                # then rescale back to mmol/g for display - fitting it directly on
+                # capacity values lets the "1/(1-Xr)" term blow up and produces a
+                # nonsensical fit (very negative R2).
+                cap_max_theoretical = f_cao * 1000.0 / M_CAO
+                Xs = [c / cap_max_theoretical for c in caps]
+                fit = fit_grasa_abanades(Ns, Xs)
                 if fit:
                     N_smooth = np.linspace(min(Ns), max(Ns), 200)
-                    cap_smooth = f_grasa_abanades(N_smooth, fit["Xr"], fit["k"])
+                    X_smooth = f_grasa_abanades(N_smooth, fit["Xr"], fit["k"])
+                    cap_smooth = X_smooth * cap_max_theoretical
+                    Xr_capacity = fit["Xr"] * cap_max_theoretical
                     deac_fig = plot_deactivation_fit(Ns, caps, (N_smooth, cap_smooth), fit)
                     dcol1, dcol2 = st.columns([1, 2])
                     with dcol1:
-                        st.metric("Residual capacity, X_r", f"{fit['Xr']:.3f}")
+                        st.metric("Residual capacity", f"{Xr_capacity:.3f} mmol CO2/g")
                         st.metric("Deactivation constant, k", f"{fit['k']:.4f}")
                         st.metric("R2", f"{fit['r2']:.4f}")
                     with dcol2:
