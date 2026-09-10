@@ -252,9 +252,13 @@ with tab_load:
                 st.session_state["cycles"].append(cyc)
                 st.session_state["next_cycle_index"] += 1
                 # reset the label field's default for the *next* cycle - otherwise the
-                # text_input keeps showing this same label on every future rerun
+                # text_input keeps showing this same label on every future rerun.
+                # This must happen via a rerun: the "sel_label" widget already ran
+                # earlier in this script pass, and Streamlit forbids writing to a
+                # widget's key after it has been instantiated in the same pass.
                 st.session_state["sel_label"] = f"Cycle {st.session_state['next_cycle_index']}"
                 st.success(f"Added '{cyc_label}' ({t_start:.2f}–{t_end:.2f} min).")
+                st.rerun()
 
         # ---------------- Optional auto-detect helper ----------------
         with st.expander("Optional: auto-detect candidate cycles from a temperature plateau"):
