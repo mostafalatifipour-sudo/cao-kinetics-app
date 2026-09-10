@@ -95,83 +95,38 @@ class CycleResult:
     onset_trim_min: float = 0.0  # how much of the raw selection was trimmed as flat lead-in
 
 
-def find_reaction_onset(t: np.ndarray, w: np.ndarray, baseline_frac: float = 0.1,
-                        min_baseline_pts: int = 8, consec: int = 5,
-                        max_search_frac: float = 0.85) -> int:
-    """Find the index within a selected window where the mass actually starts
-    rising (the reaction/CO2-injection onset), so a box-selection that
-    includes some flat baseline before injection doesn't shift t=0 and bias
-    the kinetics. Returns 0 if no flat lead-in is detected (selection was
-    already tight).
-
-    Works on the *rate of change* of (smoothed) weight rather than the raw
-    weight level: this adapts automatically to how steep or gradual the rise
-    is and to the absolute noise level of a given TGA run, instead of
-    relying on a fixed fraction of the total mass gain (which can fail for a
-    slow/gradual rise, or for a much noisier or cleaner signal than
-    originally tuned for).
-
-    Two-pass: first find a *robustly confirmed* rise (several consecutive
-    points where the smoothed slope is clearly above the flat-baseline
-    slope noise), then walk that point back to where the slope first departs
-    from the baseline using a much smaller margin - otherwise "robustly
-    confirmed" can land several points into the ramp and bias w0."""
-    n = len(w)
-    if n < (min_baseline_pts + consec + 1):
+def find_conversion_onset(X_raw: np.ndarray, dead_time_frac: float = 0.02) -> int:
+    """Find the first index where the (provisional) conversion curve crosses
+    `dead_time_frac` of that cycle's own maximum conversion - i.e. where the
+    sample has actually started reacting with CO2, as opposed to the flat
+    "dead time" before injection where the mass is stable. Returns 0 if
+    dead_time_frac <= 0, or if the curve never clearly rises (nothing to
+    trim / degenerate cycle)."""
+    if dead_time_frac <= 0:
         return 0
-
-    t = np.asarray(t, dtype=float)
-    w = np.asarray(w, dtype=float)
-
-    # light smoothing to suppress instrument noise before differentiating
-    win = int(np.clip(n // 60, 3, 15))
-    if win % 2 == 0:
-        win += 1
-    if win >= 3:
-        w_smooth = pd.Series(w).rolling(window=win, center=True, min_periods=1).mean().values
-    else:
-        w_smooth = w
-
-    dw = np.gradient(w_smooth, t)
-
-    n_base = int(np.clip(baseline_frac * n, min_baseline_pts, n // 3))
-    base_dw = dw[:n_base]
-    base_mean = float(np.mean(base_dw))
-    base_std = float(np.std(base_dw))
-
-    max_dw = float(np.max(dw))
-    rise_scale = max(max_dw - base_mean, 1e-12)
-    if rise_scale <= 1e-9:
-        return 0  # essentially flat throughout - nothing to trim
-
-    confirm_threshold = base_mean + max(6.0 * base_std, 0.05 * rise_scale)
-    above = dw > confirm_threshold
-    max_search = int(np.clip(max_search_frac * n, 0, n - consec - 1))
-
-    confirmed_idx = None
-    for i in range(0, max_search + 1):
-        if above[i:i + consec].all():
-            confirmed_idx = i
-            break
-    if confirmed_idx is None:
+    X_raw = np.asarray(X_raw, dtype=float)
+    X_max = float(np.max(X_raw))
+    if X_max <= 0:
         return 0
-
-    # back off to where the slope first departs from the baseline noise
-    small_threshold = base_mean + max(2.5 * base_std, 0.01 * rise_scale)
-    j = confirmed_idx
-    while j > 0 and dw[j - 1] > small_threshold:
-        j -= 1
-    return j
+    threshold = dead_time_frac * X_max
+    idx = np.argmax(X_raw >= threshold)
+    if X_raw[idx] < threshold:
+        return 0  # never crosses - leave as-is rather than trimming everything
+    return int(idx)
 
 
 def extract_cycle(df: pd.DataFrame, cycle: Cycle, f_cao: float = 1.0,
-                   weight_units: str = "mg", auto_trim_onset: bool = True) -> CycleResult:
+                   weight_units: str = "mg", dead_time_frac: float = 0.02) -> CycleResult:
     """Slice df to [t_start, t_end], compute conversion and capacity.
 
-    If auto_trim_onset is True (default), any flat baseline at the start of
-    the selected window (e.g. before CO2 injection) is automatically
-    detected and trimmed so t=0 / w0 correspond to the actual reaction
-    onset rather than wherever the box-selection happened to start."""
+    `dead_time_frac` (e.g. 0.02 = 2%) ignores the pre-reaction "dead time":
+    a provisional conversion curve is computed using the raw selection's
+    first point as w0, the first point where that conversion crosses
+    dead_time_frac * (that cycle's own max conversion) is located, everything
+    before it is dropped, and t=0 / w0 are reset to that point - so even if
+    the box-selection started a little early while the sample was still
+    flat, the fit only ever sees the real carbonation curve. Set to 0 to
+    disable and use the selection exactly as drawn."""
     seg = df[(df["Time_min"] >= cycle.t_start) & (df["Time_min"] <= cycle.t_end)].copy()
     seg = seg.sort_values("Time_min").reset_index(drop=True)
     if len(seg) < 2:
@@ -182,8 +137,11 @@ def extract_cycle(df: pd.DataFrame, cycle: Cycle, f_cao: float = 1.0,
     t_rel = (seg["Time_min"].values - seg["Time_min"].values[0])
 
     onset_trim_min = 0.0
-    if auto_trim_onset:
-        onset_idx = find_reaction_onset(t_rel, w)
+    if dead_time_frac > 0:
+        w0_raw = float(w[0])
+        denom_raw = w0_raw * max(f_cao, 1e-9) * THEORETICAL_MASS_GAIN_FRACTION
+        X_raw = (w - w0_raw) / denom_raw if denom_raw > 0 else np.zeros_like(w)
+        onset_idx = find_conversion_onset(X_raw, dead_time_frac)
         if onset_idx > 0:
             onset_trim_min = float(t_rel[onset_idx])
             w = w[onset_idx:]

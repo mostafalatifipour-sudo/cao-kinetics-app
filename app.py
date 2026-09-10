@@ -89,13 +89,16 @@ with st.sidebar:
              "fitting - the headline mmol CO2/g capacity is always on a whole-sorbent basis.",
     )
 
-    auto_trim_onset = st.checkbox(
-        "Auto-trim flat lead-in before reaction onset", value=True,
-        help="If your box-selection includes some flat baseline before CO2 "
-             "injection / mass rise, automatically find where the mass actually "
-             "starts rising and use that as t=0 / w0 instead of the raw "
-             "selection start. Turn off to use the selection exactly as drawn.",
+    dead_time_pct = st.slider(
+        "Ignore pre-reaction dead time (%)", min_value=0, max_value=20, value=2, step=1,
+        help="If your box-selection starts a little early, while the sample is "
+             "still flat (not yet exposed to CO2), this drops everything before "
+             "the first point where conversion crosses this % of that cycle's "
+             "own max conversion, and resets t=0 / w0 to that point. So the fit "
+             "only ever sees the real carbonation curve. Set to 0 to use the "
+             "selection exactly as drawn.",
     )
+    dead_time_frac = dead_time_pct / 100.0
 
     st.markdown("---")
     with st.expander("Advanced: fitting speed / resolution"):
@@ -289,7 +292,7 @@ with tab_load:
                     res = extract_cycle(df if cyc.source_file == fname else
                                         st.session_state["dataframes"].get(cyc.source_file, df),
                                         cyc, f_cao=f_cao, weight_units=weight_units_key,
-                                        auto_trim_onset=auto_trim_onset)
+                                        dead_time_frac=dead_time_frac)
                     rows.append({
                         "#": i, "Label": cyc.label, "Cycle index": cyc.cycle_index,
                         "File": cyc.source_file, "t_start (min)": round(cyc.t_start, 3),
@@ -340,7 +343,7 @@ with tab_kinetics:
         cyc = next(c for c in cycles if c.label == chosen_label)
         src_df = st.session_state["dataframes"].get(cyc.source_file)
         cyc_res = extract_cycle(src_df, cyc, f_cao=f_cao, weight_units=weight_units_key,
-                                auto_trim_onset=auto_trim_onset)
+                                dead_time_frac=dead_time_frac)
         if cyc_res.onset_trim_min > 0:
             st.caption(
                 f"Trimmed {cyc_res.onset_trim_min:.2f} min of flat baseline before the "
@@ -487,7 +490,7 @@ with tab_compare:
             for c in selected_cycles:
                 src_df = st.session_state["dataframes"].get(c.source_file)
                 cycle_results.append(extract_cycle(src_df, c, f_cao=f_cao, weight_units=weight_units_key,
-                                                   auto_trim_onset=auto_trim_onset))
+                                                   dead_time_frac=dead_time_frac))
 
             summary_rows = [{
                 "Label": cr.label, "Cycle index": cr.cycle_index,
