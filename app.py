@@ -89,6 +89,14 @@ with st.sidebar:
              "fitting - the headline mmol CO2/g capacity is always on a whole-sorbent basis.",
     )
 
+    auto_trim_onset = st.checkbox(
+        "Auto-trim flat lead-in before reaction onset", value=True,
+        help="If your box-selection includes some flat baseline before CO2 "
+             "injection / mass rise, automatically find where the mass actually "
+             "starts rising and use that as t=0 / w0 instead of the raw "
+             "selection start. Turn off to use the selection exactly as drawn.",
+    )
+
     st.markdown("---")
     with st.expander("Advanced: fitting speed / resolution"):
         max_fit_points = st.slider(
@@ -280,12 +288,14 @@ with tab_load:
                 try:
                     res = extract_cycle(df if cyc.source_file == fname else
                                         st.session_state["dataframes"].get(cyc.source_file, df),
-                                        cyc, f_cao=f_cao, weight_units=weight_units_key)
+                                        cyc, f_cao=f_cao, weight_units=weight_units_key,
+                                        auto_trim_onset=auto_trim_onset)
                     rows.append({
                         "#": i, "Label": cyc.label, "Cycle index": cyc.cycle_index,
                         "File": cyc.source_file, "t_start (min)": round(cyc.t_start, 3),
                         "t_end (min)": round(cyc.t_end, 3),
                         "Duration (min)": round(cyc.t_end - cyc.t_start, 3),
+                        "Onset trimmed (min)": round(res.onset_trim_min, 3),
                         "w0 (mg)": round(res.w0_mg, 5),
                         "Capacity (mmol CO2/g)": round(res.capacity_mmol_per_g, 4),
                         "X_max": round(float(res.X.max()), 4),
@@ -294,6 +304,7 @@ with tab_load:
                     rows.append({"#": i, "Label": cyc.label, "Cycle index": cyc.cycle_index,
                                "File": cyc.source_file, "t_start (min)": cyc.t_start,
                                "t_end (min)": cyc.t_end, "Duration (min)": None,
+                               "Onset trimmed (min)": None,
                                "w0 (mg)": None, "Capacity (mmol CO2/g)": None, "X_max": None})
             cyc_table = pd.DataFrame(rows)
             st.dataframe(cyc_table, use_container_width=True, hide_index=True)
@@ -328,7 +339,13 @@ with tab_kinetics:
         chosen_label = st.selectbox("Cycle to analyze", labels, key="kin_cycle_select")
         cyc = next(c for c in cycles if c.label == chosen_label)
         src_df = st.session_state["dataframes"].get(cyc.source_file)
-        cyc_res = extract_cycle(src_df, cyc, f_cao=f_cao, weight_units=weight_units_key)
+        cyc_res = extract_cycle(src_df, cyc, f_cao=f_cao, weight_units=weight_units_key,
+                                auto_trim_onset=auto_trim_onset)
+        if cyc_res.onset_trim_min > 0:
+            st.caption(
+                f"Trimmed {cyc_res.onset_trim_min:.2f} min of flat baseline before the "
+                "detected reaction onset (t=0 below is the onset, not the raw selection start)."
+            )
 
         m1, m2, m3, m4 = st.columns(4)
         m1.metric("w0 (calcined mass)", f"{cyc_res.w0_mg:.4f} mg")
@@ -469,7 +486,8 @@ with tab_compare:
             cycle_results = []
             for c in selected_cycles:
                 src_df = st.session_state["dataframes"].get(c.source_file)
-                cycle_results.append(extract_cycle(src_df, c, f_cao=f_cao, weight_units=weight_units_key))
+                cycle_results.append(extract_cycle(src_df, c, f_cao=f_cao, weight_units=weight_units_key,
+                                                   auto_trim_onset=auto_trim_onset))
 
             summary_rows = [{
                 "Label": cr.label, "Cycle index": cr.cycle_index,

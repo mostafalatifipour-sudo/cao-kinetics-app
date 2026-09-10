@@ -92,11 +92,66 @@ class CycleResult:
     capacity_mmol_per_g: float  # CO2 capture capacity, mmol CO2 / g sorbent
     f_cao: float
     cycle_index: int = 0
+    onset_trim_min: float = 0.0  # how much of the raw selection was trimmed as flat lead-in
+
+
+def find_reaction_onset(t: np.ndarray, w: np.ndarray, baseline_frac: float = 0.1,
+                        min_baseline_pts: int = 8, rise_frac: float = 0.03,
+                        consec: int = 5, max_trim_frac: float = 0.4) -> int:
+    """Find the index within a selected window where the mass actually starts
+    rising (the reaction/CO2-injection onset), so a box-selection that
+    includes some flat baseline before injection doesn't shift t=0 and bias
+    the kinetics. Returns 0 if no flat lead-in is detected (selection was
+    already tight).
+
+    Two-pass: first find a *robustly confirmed* rise (several consecutive
+    points clearly above the flat baseline, to avoid triggering on noise),
+    then walk that point back to where the mass first departs from the
+    baseline using a much smaller margin - otherwise, on a sharp/fast rise,
+    "robustly confirmed" can land several points into the ramp and bias the
+    computed w0 (and hence capacity and kinetics)."""
+    n = len(w)
+    if n < (min_baseline_pts + consec + 1):
+        return 0
+
+    n_base = int(np.clip(baseline_frac * n, min_baseline_pts, n // 3))
+    baseline = w[:n_base]
+    base_mean = float(np.mean(baseline))
+    base_std = float(np.std(baseline))
+
+    total_rise = float(np.max(w) - base_mean)
+    if total_rise <= 0:
+        return 0
+
+    threshold = base_mean + max(3.0 * base_std, rise_frac * total_rise)
+    above = w > threshold
+    max_start = int(np.clip(max_trim_frac * n, 0, n - consec - 1))
+
+    confirmed_idx = None
+    for i in range(0, max_start + 1):
+        if above[i:i + consec].all():
+            confirmed_idx = i
+            break
+    if confirmed_idx is None:
+        return 0
+
+    # back off to the true departure point using a much tighter margin
+    small_margin = max(2.0 * base_std, 0.005 * total_rise)
+    small_threshold = base_mean + small_margin
+    j = confirmed_idx
+    while j > 0 and w[j - 1] > small_threshold:
+        j -= 1
+    return j
 
 
 def extract_cycle(df: pd.DataFrame, cycle: Cycle, f_cao: float = 1.0,
-                   weight_units: str = "mg") -> CycleResult:
-    """Slice df to [t_start, t_end], compute conversion and capacity."""
+                   weight_units: str = "mg", auto_trim_onset: bool = True) -> CycleResult:
+    """Slice df to [t_start, t_end], compute conversion and capacity.
+
+    If auto_trim_onset is True (default), any flat baseline at the start of
+    the selected window (e.g. before CO2 injection) is automatically
+    detected and trimmed so t=0 / w0 correspond to the actual reaction
+    onset rather than wherever the box-selection happened to start."""
     seg = df[(df["Time_min"] >= cycle.t_start) & (df["Time_min"] <= cycle.t_end)].copy()
     seg = seg.sort_values("Time_min").reset_index(drop=True)
     if len(seg) < 2:
@@ -105,6 +160,14 @@ def extract_cycle(df: pd.DataFrame, cycle: Cycle, f_cao: float = 1.0,
     unit_factor = 1.0 if weight_units == "mg" else 1000.0  # µg -> mg
     w = seg["Weight_mg"].values / unit_factor
     t_rel = (seg["Time_min"].values - seg["Time_min"].values[0])
+
+    onset_trim_min = 0.0
+    if auto_trim_onset:
+        onset_idx = find_reaction_onset(t_rel, w)
+        if onset_idx > 0:
+            onset_trim_min = float(t_rel[onset_idx])
+            w = w[onset_idx:]
+            t_rel = t_rel[onset_idx:] - t_rel[onset_idx]
 
     w0 = float(w[0])
     delta_w = w - w0
@@ -123,7 +186,7 @@ def extract_cycle(df: pd.DataFrame, cycle: Cycle, f_cao: float = 1.0,
         label=cycle.label, t_start=cycle.t_start, t_end=cycle.t_end,
         t_rel=t_rel, X=X, weight_mg=w, w0_mg=w0,
         delta_w_final_mg=delta_w_final, capacity_mmol_per_g=capacity_mmol_per_g,
-        f_cao=f_cao, cycle_index=cycle.cycle_index,
+        f_cao=f_cao, cycle_index=cycle.cycle_index, onset_trim_min=onset_trim_min,
     )
 
 
