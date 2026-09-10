@@ -96,50 +96,70 @@ class CycleResult:
 
 
 def find_reaction_onset(t: np.ndarray, w: np.ndarray, baseline_frac: float = 0.1,
-                        min_baseline_pts: int = 8, rise_frac: float = 0.03,
-                        consec: int = 5, max_trim_frac: float = 0.4) -> int:
+                        min_baseline_pts: int = 8, consec: int = 5,
+                        max_search_frac: float = 0.85) -> int:
     """Find the index within a selected window where the mass actually starts
     rising (the reaction/CO2-injection onset), so a box-selection that
     includes some flat baseline before injection doesn't shift t=0 and bias
     the kinetics. Returns 0 if no flat lead-in is detected (selection was
     already tight).
 
+    Works on the *rate of change* of (smoothed) weight rather than the raw
+    weight level: this adapts automatically to how steep or gradual the rise
+    is and to the absolute noise level of a given TGA run, instead of
+    relying on a fixed fraction of the total mass gain (which can fail for a
+    slow/gradual rise, or for a much noisier or cleaner signal than
+    originally tuned for).
+
     Two-pass: first find a *robustly confirmed* rise (several consecutive
-    points clearly above the flat baseline, to avoid triggering on noise),
-    then walk that point back to where the mass first departs from the
-    baseline using a much smaller margin - otherwise, on a sharp/fast rise,
-    "robustly confirmed" can land several points into the ramp and bias the
-    computed w0 (and hence capacity and kinetics)."""
+    points where the smoothed slope is clearly above the flat-baseline
+    slope noise), then walk that point back to where the slope first departs
+    from the baseline using a much smaller margin - otherwise "robustly
+    confirmed" can land several points into the ramp and bias w0."""
     n = len(w)
     if n < (min_baseline_pts + consec + 1):
         return 0
 
+    t = np.asarray(t, dtype=float)
+    w = np.asarray(w, dtype=float)
+
+    # light smoothing to suppress instrument noise before differentiating
+    win = int(np.clip(n // 60, 3, 15))
+    if win % 2 == 0:
+        win += 1
+    if win >= 3:
+        w_smooth = pd.Series(w).rolling(window=win, center=True, min_periods=1).mean().values
+    else:
+        w_smooth = w
+
+    dw = np.gradient(w_smooth, t)
+
     n_base = int(np.clip(baseline_frac * n, min_baseline_pts, n // 3))
-    baseline = w[:n_base]
-    base_mean = float(np.mean(baseline))
-    base_std = float(np.std(baseline))
+    base_dw = dw[:n_base]
+    base_mean = float(np.mean(base_dw))
+    base_std = float(np.std(base_dw))
 
-    total_rise = float(np.max(w) - base_mean)
-    if total_rise <= 0:
-        return 0
+    max_dw = float(np.max(dw))
+    rise_scale = max(max_dw - base_mean, 1e-12)
+    if rise_scale <= 1e-9:
+        return 0  # essentially flat throughout - nothing to trim
 
-    threshold = base_mean + max(3.0 * base_std, rise_frac * total_rise)
-    above = w > threshold
-    max_start = int(np.clip(max_trim_frac * n, 0, n - consec - 1))
+    confirm_threshold = base_mean + max(6.0 * base_std, 0.05 * rise_scale)
+    above = dw > confirm_threshold
+    max_search = int(np.clip(max_search_frac * n, 0, n - consec - 1))
 
     confirmed_idx = None
-    for i in range(0, max_start + 1):
+    for i in range(0, max_search + 1):
         if above[i:i + consec].all():
             confirmed_idx = i
             break
     if confirmed_idx is None:
         return 0
 
-    # back off to the true departure point using a much tighter margin
-    small_margin = max(2.0 * base_std, 0.005 * total_rise)
-    small_threshold = base_mean + small_margin
+    # back off to where the slope first departs from the baseline noise
+    small_threshold = base_mean + max(2.5 * base_std, 0.01 * rise_scale)
     j = confirmed_idx
-    while j > 0 and w[j - 1] > small_threshold:
+    while j > 0 and dw[j - 1] > small_threshold:
         j -= 1
     return j
 
